@@ -5,3 +5,5 @@ pandas
 PyPDF2
 docx2txt
 openpyxl
+faiss-cpu
+chromadb
