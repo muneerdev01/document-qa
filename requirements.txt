@@ -1,2 +1,7 @@
 streamlit
 openai
+numpy
+pandas
+PyPDF2
+docx2txt
+openpyxl
