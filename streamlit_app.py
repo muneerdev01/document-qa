@@ -1,64 +1,38 @@
 import streamlit as st
 from openai import OpenAI
-import faiss
+import chromadb
 import numpy as np
-import pandas as pd
 import docx2txt
 import PyPDF2
+import pandas as pd
 
 # ---------------- UI ---------------- #
-st.set_page_config(page_title="Doc AI Assistant", layout="wide")
-st.title("📄 Smart Document Q&A System (RAG + Multi-File Support)")
+st.set_page_config(page_title="ChatDoc AI", layout="wide")
+st.title("💬 ChatDoc AI (ChatGPT + RAG + Memory)")
 
 # ---------------- API KEY ---------------- #
-api_key = st.text_input("🔑 Enter OpenAI API Key", type="password")
+api_key = st.text_input("🔑 OpenAI API Key", type="password")
 
 if not api_key:
-    st.info("Please enter your OpenAI API key to continue.")
     st.stop()
 
 client = OpenAI(api_key=api_key)
 
-# ---------------- HELP ---------------- #
-with st.expander("🔑 How to get OpenAI API Key?"):
-    st.markdown("""
-1. Go to https://platform.openai.com/
-2. Sign up / Login
-3. Open API Keys section
-4. Click "Create new secret key"
-5. Copy and paste here
+# ---------------- CHROMA DB ---------------- #
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection("docs")
 
-⚠️ Never share your API key with anyone.
-""")
-
-guide_text = """
-OpenAI API Key Guide
-
-Step 1: https://platform.openai.com/
-Step 2: Sign up / Login
-Step 3: Go to API Keys
-Step 4: Create new secret key
-Step 5: Paste in app
-
-Note:
-- Keep key private
-- Usage may be paid
-"""
-
-st.download_button(
-    "📄 Download API Key Guide",
-    guide_text,
-    "api_key_guide.txt",
-    "text/plain"
-)
+# ---------------- SESSION MEMORY ---------------- #
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 # ---------------- FILE UPLOAD ---------------- #
 uploaded_file = st.file_uploader(
-    "📤 Upload your document",
+    "📄 Upload Document",
     type=["pdf", "txt", "md", "docx", "xlsx"]
 )
 
-# ---------------- TEXT EXTRACTION ---------------- #
+# ---------------- EXTRACT TEXT ---------------- #
 def extract_text(file):
     file_type = file.name.split(".")[-1].lower()
 
@@ -67,10 +41,7 @@ def extract_text(file):
 
     elif file_type == "pdf":
         reader = PyPDF2.PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        return text
+        return "".join([p.extract_text() or "" for p in reader.pages])
 
     elif file_type == "docx":
         return docx2txt.process(file)
@@ -79,82 +50,109 @@ def extract_text(file):
         df = pd.read_excel(file)
         return df.to_string(index=False)
 
-    return "Unsupported file type"
+    return ""
 
-# ---------------- RAG FUNCTIONS ---------------- #
-def chunk_text(text, chunk_size=400):
+# ---------------- CHUNK ---------------- #
+def chunk_text(text, size=400):
     words = text.split()
-    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+    return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
 
-
+# ---------------- EMBEDDING ---------------- #
 def get_embedding(text):
     return client.embeddings.create(
         model="text-embedding-3-small",
         input=text
     ).data[0].embedding
 
+# ---------------- STORE IN CHROMA ---------------- #
+def store_docs(chunks):
+    for i, chunk in enumerate(chunks):
+        emb = get_embedding(chunk)
 
-def build_vector_store(chunks):
-    embeddings = [get_embedding(c) for c in chunks]
-    dim = len(embeddings[0])
+        collection.add(
+            ids=[str(i)],
+            embeddings=[emb],
+            documents=[chunk]
+        )
 
-    index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings).astype("float32"))
+# ---------------- RETRIEVE ---------------- #
+def retrieve(query, k=3):
+    q_emb = get_embedding(query)
 
-    return index, chunks
-
-
-def retrieve(query, index, chunks, k=3):
-    q_emb = np.array([get_embedding(query)]).astype("float32")
-    _, indices = index.search(q_emb, k)
-    return [chunks[i] for i in indices[0]]
-
-
-def generate_answer(question, context):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a professional document analyst. Answer clearly and structured."
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion:\n{question}"
-            }
-        ]
+    results = collection.query(
+        query_embeddings=[q_emb],
+        n_results=k
     )
-    return response.choices[0].message.content
 
-# ---------------- MAIN ---------------- #
+    return results["documents"][0]
+
+# ---------------- GPT ANSWER ---------------- #
+def ask_ai(query, context, history):
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant with memory and document understanding."}
+    ]
+
+    # memory
+    for h in history[-5:]:
+        messages.append(h)
+
+    messages.append({
+        "role": "user",
+        "content": f"""
+Context:
+{context}
+
+Question:
+{query}
+"""
+    })
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages
+    )
+
+    return res.choices[0].message.content
+
+# ---------------- PROCESS DOCUMENT ---------------- #
 if uploaded_file:
 
-    document_text = extract_text(uploaded_file)
+    text = extract_text(uploaded_file)
+    text = text[:15000]
 
-    # safety limit
-    document_text = document_text[:12000]
+    chunks = chunk_text(text)
 
-    st.success("✅ Document Loaded Successfully")
+    with st.spinner("📦 Building knowledge base..."):
+        store_docs(chunks)
 
-    chunks = chunk_text(document_text)
+    st.success("✅ Document indexed successfully!")
 
-    with st.spinner("🔄 Building knowledge base..."):
-        index, chunks = build_vector_store(chunks)
+# ---------------- CHAT UI ---------------- #
+st.subheader("💬 Chat with your document")
 
-    st.success("✅ RAG System Ready!")
+user_query = st.text_input("Ask anything")
 
-    question = st.text_area("❓ Ask a question about your document")
+if user_query:
 
-    if question:
-        with st.spinner("🧠 Thinking..."):
+    with st.spinner("Thinking..."):
 
-            relevant_chunks = retrieve(question, index, chunks)
-            context = "\n\n".join(relevant_chunks)
+        context = retrieve(user_query)
 
-            answer = generate_answer(question, context)
+        answer = ask_ai(
+            user_query,
+            "\n\n".join(context),
+            st.session_state.chat_history
+        )
 
-        st.subheader("🧠 Answer")
-        st.write(answer)
+        # save memory
+        st.session_state.chat_history.append({"role": "user", "content": user_query})
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
-        st.subheader("📌 Retrieved Context")
-        st.write(context)
+    st.markdown("### 🧠 Answer")
+    st.write(answer)
+
+# ---------------- CHAT HISTORY ---------------- #
+st.markdown("### 🧾 Chat History")
+
+for msg in st.session_state.chat_history:
+    st.write(f"**{msg['role']}**: {msg['content']}")
