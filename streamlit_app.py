@@ -1,53 +1,160 @@
 import streamlit as st
 from openai import OpenAI
+import faiss
+import numpy as np
+import pandas as pd
+import docx2txt
+import PyPDF2
 
-# Show title and description.
-st.title("📄 Document question answering")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
+# ---------------- UI ---------------- #
+st.set_page_config(page_title="Doc AI Assistant", layout="wide")
+st.title("📄 Smart Document Q&A System (RAG + Multi-File Support)")
+
+# ---------------- API KEY ---------------- #
+api_key = st.text_input("🔑 Enter OpenAI API Key", type="password")
+
+if not api_key:
+    st.info("Please enter your OpenAI API key to continue.")
+    st.stop()
+
+client = OpenAI(api_key=api_key)
+
+# ---------------- HELP ---------------- #
+with st.expander("🔑 How to get OpenAI API Key?"):
+    st.markdown("""
+1. Go to https://platform.openai.com/
+2. Sign up / Login
+3. Open API Keys section
+4. Click "Create new secret key"
+5. Copy and paste here
+
+⚠️ Never share your API key with anyone.
+""")
+
+guide_text = """
+OpenAI API Key Guide
+
+Step 1: https://platform.openai.com/
+Step 2: Sign up / Login
+Step 3: Go to API Keys
+Step 4: Create new secret key
+Step 5: Paste in app
+
+Note:
+- Keep key private
+- Usage may be paid
+"""
+
+st.download_button(
+    "📄 Download API Key Guide",
+    guide_text,
+    "api_key_guide.txt",
+    "text/plain"
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# ---------------- FILE UPLOAD ---------------- #
+uploaded_file = st.file_uploader(
+    "📤 Upload your document",
+    type=["pdf", "txt", "md", "docx", "xlsx"]
+)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# ---------------- TEXT EXTRACTION ---------------- #
+def extract_text(file):
+    file_type = file.name.split(".")[-1].lower()
 
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
-    )
+    if file_type in ["txt", "md"]:
+        return file.read().decode("utf-8")
 
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
-    )
+    elif file_type == "pdf":
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
 
-    if uploaded_file and question:
+    elif file_type == "docx":
+        return docx2txt.process(file)
 
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-        messages = [
+    elif file_type == "xlsx":
+        df = pd.read_excel(file)
+        return df.to_string(index=False)
+
+    return "Unsupported file type"
+
+# ---------------- RAG FUNCTIONS ---------------- #
+def chunk_text(text, chunk_size=400):
+    words = text.split()
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+
+def get_embedding(text):
+    return client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    ).data[0].embedding
+
+
+def build_vector_store(chunks):
+    embeddings = [get_embedding(c) for c in chunks]
+    dim = len(embeddings[0])
+
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings).astype("float32"))
+
+    return index, chunks
+
+
+def retrieve(query, index, chunks, k=3):
+    q_emb = np.array([get_embedding(query)]).astype("float32")
+    _, indices = index.search(q_emb, k)
+    return [chunks[i] for i in indices[0]]
+
+
+def generate_answer(question, context):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a professional document analyst. Answer clearly and structured."
+            },
             {
                 "role": "user",
-                "content": f"Here's a document: {document} \n\n---\n\n {question}",
+                "content": f"Context:\n{context}\n\nQuestion:\n{question}"
             }
         ]
+    )
+    return response.choices[0].message.content
 
-        # Generate an answer using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
-        )
+# ---------------- MAIN ---------------- #
+if uploaded_file:
 
-        # Stream the response to the app using `st.write_stream`.
-        st.write_stream(stream)
+    document_text = extract_text(uploaded_file)
+
+    # safety limit
+    document_text = document_text[:12000]
+
+    st.success("✅ Document Loaded Successfully")
+
+    chunks = chunk_text(document_text)
+
+    with st.spinner("🔄 Building knowledge base..."):
+        index, chunks = build_vector_store(chunks)
+
+    st.success("✅ RAG System Ready!")
+
+    question = st.text_area("❓ Ask a question about your document")
+
+    if question:
+        with st.spinner("🧠 Thinking..."):
+
+            relevant_chunks = retrieve(question, index, chunks)
+            context = "\n\n".join(relevant_chunks)
+
+            answer = generate_answer(question, context)
+
+        st.subheader("🧠 Answer")
+        st.write(answer)
+
+        st.subheader("📌 Retrieved Context")
+        st.write(context)
